@@ -10,6 +10,7 @@ static struct config {
     uint64_t threads;
     uint64_t timeout;
     uint64_t pipeline;
+    uint64_t period;
     bool     delay;
     bool     dynamic;
     bool     latency;
@@ -53,6 +54,7 @@ static void usage() {
            "        --latency          Print latency statistics   \n"
            "        --timeout     <T>  Socket/request timeout     \n"
            "    -v, --version          Print version details      \n"
+           "    -p, --period      <N>  Print result period  time(s)\n"
            "                                                      \n"
            "  Numeric arguments may include a SI unit (1k, 1M, 1G)\n"
            "  Time arguments may include a time unit (2s, 2m, 2h)\n");
@@ -139,10 +141,24 @@ int main(int argc, char **argv) {
     printf("  %"PRIu64" threads and %"PRIu64" connections\n", cfg.threads, cfg.connections);
 
     uint64_t start    = time_us();
+    /*
     uint64_t complete = 0;
     uint64_t bytes    = 0;
-    errors errors     = { 0 };
+    errors errors     = { 0 };    
+    */
+    p_result *pr = zcalloc(sizeof(p_result));
+    pr->start = start;
+    pr->L = L;
+    pr->threads = threads;
+    aeEventLoop *main_loop = aeCreateEventLoop(cfg.connections);
+    aeCreateTimeEvent(main_loop, cfg.duration*1000, print_result_once, pr, NULL);
+    if(cfg.period){
+        aeCreateTimeEvent(main_loop, cfg.period*1000, print_result_timer, pr, NULL);
+    }
+    aeMain(main_loop);
+    aeDeleteEventLoop(main_loop);
 
+    /*
     sleep(cfg.duration);
     stop = 1;
 
@@ -159,7 +175,7 @@ int main(int argc, char **argv) {
         errors.timeout += t->errors.timeout;
         errors.status  += t->errors.status;
     }
-
+    
     uint64_t runtime_us = time_us() - start;
     long double runtime_s   = runtime_us / 1000000.0;
     long double req_per_s   = complete   / runtime_s;
@@ -195,7 +211,7 @@ int main(int argc, char **argv) {
         script_errors(L, &errors);
         script_done(L, statistics.latency, statistics.requests);
     }
-
+    */
     return 0;
 }
 
@@ -286,6 +302,80 @@ static int record_rate(aeEventLoop *loop, long long id, void *data) {
     if (stop) aeStop(loop);
 
     return RECORD_INTERVAL_MS;
+}
+
+static int print_result_once(aeEventLoop *loop, long long id, void *data) {
+    stop = 1;   
+    print_result(loop, id, data, 1);
+    return -1;
+}
+
+static int print_result_timer(aeEventLoop *loop, long long id, void *data) {   
+    print_result(loop, id, data, 2);
+    return cfg.period*1000;
+}
+
+
+static void print_result(aeEventLoop * loop, long long id, void * data, int mode){
+    p_result *pr = data;    
+    thread *threads = pr->threads;
+    lua_State *L = pr->L;
+    uint64_t complete = 0;
+    uint64_t bytes    = 0;
+    errors errors     = { 0 };    
+    
+    for (uint64_t i = 0; i < cfg.threads; i++) {
+        thread *t = &threads[i];
+        if(mode == 1){
+            pthread_join(t->thread, NULL);
+        }
+        complete += t->complete;
+        bytes    += t->bytes;
+
+        errors.connect += t->errors.connect;
+        errors.read    += t->errors.read;
+        errors.write   += t->errors.write;
+        errors.timeout += t->errors.timeout;
+        errors.status  += t->errors.status;
+    }
+
+    uint64_t runtime_us = time_us() - pr->start;
+    long double runtime_s   = runtime_us / 1000000.0;
+    long double req_per_s   = complete   / runtime_s;
+    long double bytes_per_s = bytes      / runtime_s;
+
+    if (complete / cfg.connections > 0) {
+        int64_t interval = runtime_us / (complete / cfg.connections);
+        stats_correct(statistics.latency, interval);
+    }
+
+    print_stats_header();
+    print_stats("Latency", statistics.latency, format_time_us);
+    print_stats("Req/Sec", statistics.requests, format_metric);
+    if (cfg.latency) print_stats_latency(statistics.latency);
+
+    char *runtime_msg = format_time_us(runtime_us);
+
+    printf("  %"PRIu64" requests in %s, %sB read\n", complete, runtime_msg, format_binary(bytes));
+    if (errors.connect || errors.read || errors.write || errors.timeout) {
+        printf("  Socket errors: connect %d, read %d, write %d, timeout %d\n",
+               errors.connect, errors.read, errors.write, errors.timeout);
+    }
+
+    if (errors.status) {
+        printf("  Non-2xx or 3xx responses: %d\n", errors.status);
+    }
+
+    printf("Requests/sec: %9.2Lf\n", req_per_s);
+    printf("Transfer/sec: %10sB\n", format_binary(bytes_per_s));
+
+    if (script_has_done(L)) {
+        script_summary(L, runtime_us, complete, bytes);
+        script_errors(L, &errors);
+        script_done(L, statistics.latency, statistics.requests);
+    }
+
+    if (stop) aeStop(loop);
 }
 
 static int delay_request(aeEventLoop *loop, long long id, void *data) {
@@ -469,6 +559,7 @@ static char *copy_url_part(char *url, struct http_parser_url *parts, enum http_p
 static struct option longopts[] = {
     { "connections", required_argument, NULL, 'c' },
     { "duration",    required_argument, NULL, 'd' },
+    { "period",      required_argument, NULL, 'p' },
     { "threads",     required_argument, NULL, 't' },
     { "script",      required_argument, NULL, 's' },
     { "header",      required_argument, NULL, 'H' },
@@ -489,7 +580,7 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
     cfg->duration    = 10;
     cfg->timeout     = SOCKET_TIMEOUT_MS;
 
-    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:Lrv?", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "t:c:d:p:s:H:T:Lrv?", longopts, NULL)) != -1) {
         switch (c) {
             case 't':
                 if (scan_metric(optarg, &cfg->threads)) return -1;
@@ -499,6 +590,9 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
                 break;
             case 'd':
                 if (scan_time(optarg, &cfg->duration)) return -1;
+                break;
+            case 'p':
+                if (scan_time(optarg, &cfg->period)) return -1;
                 break;
             case 's':
                 cfg->script = optarg;

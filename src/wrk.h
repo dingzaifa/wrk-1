@@ -63,4 +63,11 @@ typedef struct connection {
     char buf[RECVBUF];
 } connection;
 
+typedef struct {
+        uint64_t start;
+        thread *threads;
+        lua_State *L;
+}p_result;
+
+
 #endif /* WRK_H */
